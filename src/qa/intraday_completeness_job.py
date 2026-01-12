@@ -20,8 +20,30 @@ TIMEFRAME_MINUTES = {
 }
 
 # ─────────────────────────────────────────────
-# Helpers
+# Config helpers
 # ─────────────────────────────────────────────
+
+def normalize_symbols(cfg) -> list[str]:
+    """
+    Normalize symbol(s) from config.
+
+    Supports:
+      - symbol: "TCS"
+      - symbols: ["TCS", "INFY"]
+    """
+    if "symbols" in cfg:
+        symbols = cfg["symbols"]
+        if not isinstance(symbols, list):
+            raise ValueError("'symbols' must be a list")
+        return symbols
+
+    if "symbol" in cfg:
+        return [cfg["symbol"]]
+
+    raise ValueError(
+        "Config must define either 'symbol' or 'symbols'"
+    )
+
 
 def parse_date(value):
     """
@@ -35,6 +57,9 @@ def parse_date(value):
         return datetime.strptime(value, "%Y-%m-%d").date()
     raise ValueError(f"Invalid date value: {value}")
 
+# ─────────────────────────────────────────────
+# Candle helpers
+# ─────────────────────────────────────────────
 
 def expected_intraday_candles(trade_date, timeframe, market_open, market_close):
     """
@@ -85,7 +110,6 @@ def fetch_actual_candles(conn, symbol, timeframe, start_ts, end_ts):
 
     return [row["ts"].astimezone(IST) for row in rows]
 
-
 # ─────────────────────────────────────────────
 # DAILY QA (1D)
 # ─────────────────────────────────────────────
@@ -97,7 +121,7 @@ def run_daily_completeness_check(cfg) -> bool:
     - Timestamp aligned to 00:00 IST
     """
 
-    symbol = cfg["symbol"]
+    symbols = normalize_symbols(cfg)
     timeframe = cfg["timeframe"]
 
     start_raw = cfg.get("start_date") or cfg.get("start")
@@ -109,47 +133,65 @@ def run_daily_completeness_check(cfg) -> bool:
     holiday_agent = MarketHolidayAgent()
     conn = get_db_connection()
 
-    total_missing = 0
-    current = start_date
+    results = {}
+    overall_success = True
 
-    while current <= end_date:
+    for symbol in symbols:
+        logger.info(
+            f"🔍 DAILY QA START | {symbol} | {start_date} → {end_date}"
+        )
 
-        if not holiday_agent.is_trading_day(current):
-            logger.info(f"⏭️ {current} — holiday/weekend")
+        current = start_date
+        missing_days = 0
+
+        while current <= end_date:
+
+            if not holiday_agent.is_trading_day(current):
+                logger.info(f"⏭️ {current} — holiday/weekend")
+                current += timedelta(days=1)
+                continue
+
+            expected_ts = IST.localize(
+                datetime.combine(current, time(0, 0))
+            )
+
+            actual = fetch_actual_candles(
+                conn,
+                symbol,
+                timeframe,
+                expected_ts,
+                expected_ts + timedelta(days=1),
+            )
+
+            if not actual:
+                logger.error(
+                    f"❌ {symbol} | {current} — missing daily candle"
+                )
+                missing_days += 1
+            else:
+                logger.info(
+                    f"✅ {symbol} | {current} — OK"
+                )
+
             current += timedelta(days=1)
-            continue
 
-        expected_ts = IST.localize(
-            datetime.combine(current, time(0, 0))
-        )
-
-        actual = fetch_actual_candles(
-            conn,
-            symbol,
-            timeframe,
-            expected_ts,
-            expected_ts + timedelta(days=1),
-        )
-
-        if not actual:
-            logger.error(f"❌ {current} — missing daily candle")
-            total_missing += 1
+        if missing_days > 0:
+            logger.error(
+                f"❌ DAILY QA FAILED | {symbol} | "
+                f"missing days = {missing_days}"
+            )
+            results[symbol] = (False, f"missing {missing_days} days")
+            overall_success = False
         else:
-            logger.info(f"✅ {current} — OK")
-
-        current += timedelta(days=1)
+            logger.info(
+                f"🎉 DAILY QA PASSED | {symbol}"
+            )
+            results[symbol] = (True, "OK")
 
     conn.close()
 
-    if total_missing > 0:
-        logger.error(
-            f"❌ DAILY QA FAILED | missing days = {total_missing}"
-        )
-        return False
-
-    logger.info("🎉 DAILY QA PASSED — all daily candles present")
-    return True
-
+    _print_qa_summary(results, overall_success, timeframe="1D")
+    return overall_success
 
 # ─────────────────────────────────────────────
 # INTRADAY QA
@@ -159,30 +201,28 @@ def run_intraday_completeness_check(config_path: str) -> bool:
     """
     Automated QA job:
     - Validates intraday candle completeness
-    - Automatically routes 1D to daily QA
+    - Supports multi-symbol configs
+    - Routes 1D to daily QA
     """
 
     logger.info(f"📄 Loading QA config: {config_path}")
 
-    # ─── Load config ───
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f) or {}
 
-    symbol = cfg["symbol"]
+    symbols = normalize_symbols(cfg)
     timeframe = cfg["timeframe"]
 
-    # ✅ Route DAILY timeframe early
+    # 🔀 Route DAILY timeframe
     if timeframe == "1D":
         logger.info("⏭️ Detected 1D timeframe — running daily QA")
         return run_daily_completeness_check(cfg)
 
-    # ─── Respect checks flag ───
     checks = cfg.get("checks", {})
     if not checks.get("intraday_completeness", True):
         logger.info("⏭️ Intraday completeness check disabled via config")
         return True
 
-    # ─── Extract date range ───
     start_raw = cfg.get("start_date") or cfg.get("start")
     end_raw = cfg.get("end_date") or cfg.get("end")
 
@@ -197,65 +237,97 @@ def run_intraday_completeness_check(config_path: str) -> bool:
     market_open = time.fromisoformat(cfg["market"]["open"])
     market_close = time.fromisoformat(cfg["market"]["close"])
 
-    logger.info(
-        f"🔍 QA START | {symbol} | {timeframe} | {start_date} → {end_date}"
-    )
-
     holiday_agent = MarketHolidayAgent()
     conn = get_db_connection()
 
-    total_missing = 0
-    current = start_date
-
+    results = {}
+    overall_success = True
     allow_missing_days = checks.get("allow_missing_days", False)
 
-    while current <= end_date:
-
-        if not holiday_agent.is_trading_day(current):
-            logger.info(f"⏭️ {current} — holiday/weekend")
-            current += timedelta(days=1)
-            continue
-
-        expected = expected_intraday_candles(
-            current, timeframe, market_open, market_close
+    for symbol in symbols:
+        logger.info(
+            f"🔍 QA START | {symbol} | {timeframe} | "
+            f"{start_date} → {end_date}"
         )
 
-        actual = fetch_actual_candles(
-            conn,
-            symbol,
-            timeframe,
-            expected[0],
-            IST.localize(datetime.combine(current, market_close)),
-        )
+        total_missing = 0
+        current = start_date
 
-        missing = sorted(set(expected) - set(actual))
+        while current <= end_date:
 
-        if missing:
-            if allow_missing_days and len(missing) == len(expected):
-                logger.warning(
-                    f"⏭️ {current} — full-day missing (treated as holiday)"
-                )
-            else:
-                logger.error(
-                    f"❌ {current} — missing {len(missing)} candles"
-                )
-                for ts in missing[:3]:
-                    logger.error(f"   ⛔ {ts}")
-                total_missing += len(missing)
-        else:
-            logger.info(
-                f"✅ {current} — OK ({len(expected)} candles)"
+            if not holiday_agent.is_trading_day(current):
+                logger.info(f"⏭️ {current} — holiday/weekend")
+                current += timedelta(days=1)
+                continue
+
+            expected = expected_intraday_candles(
+                current, timeframe, market_open, market_close
             )
 
-        current += timedelta(days=1)
+            actual = fetch_actual_candles(
+                conn,
+                symbol,
+                timeframe,
+                expected[0],
+                IST.localize(
+                    datetime.combine(current, market_close)
+                ),
+            )
+
+            missing = sorted(set(expected) - set(actual))
+
+            if missing:
+                if allow_missing_days and len(missing) == len(expected):
+                    logger.warning(
+                        f"⏭️ {symbol} | {current} — "
+                        "full-day missing (treated as holiday)"
+                    )
+                else:
+                    logger.error(
+                        f"❌ {symbol} | {current} — "
+                        f"missing {len(missing)} candles"
+                    )
+                    for ts in missing[:3]:
+                        logger.error(f"   ⛔ {ts}")
+                    total_missing += len(missing)
+            else:
+                logger.info(
+                    f"✅ {symbol} | {current} — "
+                    f"OK ({len(expected)} candles)"
+                )
+
+            current += timedelta(days=1)
+
+        if total_missing > 0:
+            logger.error(
+                f"❌ QA FAILED | {symbol} | "
+                f"total missing candles = {total_missing}"
+            )
+            results[symbol] = (False, f"missing {total_missing} candles")
+            overall_success = False
+        else:
+            logger.info(
+                f"🎉 QA PASSED | {symbol}"
+            )
+            results[symbol] = (True, "OK")
 
     conn.close()
 
-    if total_missing > 0:
-        logger.error(
-            f"❌ QA FAILED | total missing candles = {total_missing}"
-        )
-        return False
+    _print_qa_summary(results, overall_success, timeframe)
+    return overall_success
 
-    logger.info("🎉 QA PASSED — all intraday candles present")
-    return True
+# ─────────────────────────────────────────────
+# QA SUMMARY PRINTER
+# ─────────────────────────────────────────────
+
+def _print_qa_summary(results: dict, overall_success: bool, timeframe: str):
+    logger.info(f"📊 QA SUMMARY ({timeframe})")
+    logger.info("-" * 40)
+
+    for symbol, (passed, detail) in results.items():
+        status = "✅ PASS" if passed else "❌ FAIL"
+        logger.info(f"{symbol:<12} : {status} ({detail})")
+
+    logger.info("-" * 40)
+    final_status = "✅ PASS" if overall_success else "❌ FAIL"
+    logger.info(f"OVERALL RESULT: {final_status}")

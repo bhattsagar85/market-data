@@ -1,6 +1,4 @@
-# src/data_ingestion/orchestrator.py
-
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 import pandas as pd
 import pytz
 import logging
@@ -19,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
 
+MAX_BACKFILL_DAYS = 90
+
 # Default backfill windows (minutes) for first-ever intraday runs
 DEFAULT_INTRADAY_LOOKBACK_MINUTES = {
     "15M": 7 * 24 * 60,
@@ -29,17 +29,6 @@ DEFAULT_INTRADAY_LOOKBACK_MINUTES = {
 # ─────────────────────────────────────────────
 # Timeframe helpers
 # ─────────────────────────────────────────────
-
-# def _timeframe_delta(timeframe: str) -> timedelta:
-#     if timeframe == "1D":
-#         return timedelta(days=1)
-#     if timeframe == "15M":
-#         return timedelta(minutes=15)
-#     if timeframe == "5M":
-#         return timedelta(minutes=5)
-#     if timeframe == "1M":
-#         return timedelta(minutes=1)
-#     raise ValueError(f"Unsupported timeframe: {timeframe}")
 
 def _timeframe_delta(timeframe: str) -> timedelta:
     try:
@@ -72,31 +61,6 @@ def align_to_timeframe(ts: datetime, timeframe: str) -> datetime:
         microsecond=0,
     )
 
-MAX_BACKFILL_DAYS = 90
-
-
-# def align_to_timeframe(ts: datetime, timeframe: str) -> datetime:
-#     ts = ts.astimezone(IST)
-
-#     if timeframe == "15M":
-#         minute = (ts.minute // 15) * 15
-#         return ts.replace(minute=minute, second=0, microsecond=0)
-    
-#     if timeframe == "10M":
-#         minute = (ts.minute // 10) * 10
-#         return ts.replace(minute=minute, second=0, microsecond=0)
-
-#     if timeframe == "5M":
-#         minute = (ts.minute // 5) * 5
-#         return ts.replace(minute=minute, second=0, microsecond=0)
-
-#     if timeframe == "1M":
-#         return ts.replace(second=0, microsecond=0)
-
-#     # Daily
-#     return ts.replace(hour=0, minute=0, second=0, microsecond=0)
-
-
 # ─────────────────────────────────────────────
 # Incremental start resolution
 # ─────────────────────────────────────────────
@@ -114,7 +78,6 @@ def resolve_start_ts(conn, symbol: str, timeframe: str) -> datetime:
     lookback_minutes = DEFAULT_INTRADAY_LOOKBACK_MINUTES[timeframe]
     return now - timedelta(minutes=lookback_minutes)
 
-
 # ─────────────────────────────────────────────
 # Incremental ingestion (scheduler jobs)
 # ─────────────────────────────────────────────
@@ -126,28 +89,12 @@ def ingest_symbol(conn, symbol: str, timeframe: str):
     def get_safe_now(timeframe: str, now: datetime) -> datetime:
         if timeframe == "1D":
             return now - timedelta(days=3)
+
         minutes = TIMEFRAMES[timeframe]["minutes"]
-        # 3 candle buffer, minimum 5 minutes
         buffer_minutes = max(minutes * 3, 5)
         return now - timedelta(minutes=buffer_minutes)
 
     safe_now = get_safe_now(timeframe, now)
-
-
-
-    # # Safety lag
-    # if timeframe == "15M":
-    #     safe_now = now - timedelta(minutes=45)
-    # elif timeframe == "10M":
-    #     safe_now = now - timedelta(minutes=30)
-    # elif timeframe == "5M":
-    #     safe_now = now - timedelta(minutes=15)
-    # elif timeframe == "1M":
-    #     safe_now = now - timedelta(minutes=5)
-    # elif timeframe == "1D":
-    #     safe_now = now - timedelta(days=3)  # weekend/holiday safe
-    # else:
-    #     safe_now = now
 
     start = align_to_timeframe(start, timeframe)
     end = align_to_timeframe(safe_now, timeframe)
@@ -210,50 +157,9 @@ def run_ingestion_job(job_name: str, symbols: list[str]):
     finally:
         conn.close()
 
-
 # ─────────────────────────────────────────────
-# Pure backfill runner
+# Backfill logic (single unit)
 # ─────────────────────────────────────────────
-
-# def run_backfill(
-#     symbol: str,
-#     timeframe: str,
-#     start: datetime,
-#     end: datetime,
-# ):
-#     logger.info(
-#         f"🚀 Backfill start | {symbol} | {timeframe} | {start} → {end}"
-#     )
-
-#     start = align_to_timeframe(start, timeframe)
-#     end = align_to_timeframe(end, timeframe)
-
-#     if start >= end:
-#         logger.warning("Backfill start >= end — nothing to do")
-#         return
-
-#     df = fetch_candles(
-#         symbol=symbol,
-#         timeframe=timeframe,
-#         start=start,
-#         end=end,
-#     )
-
-#     if df.empty:
-#         logger.warning(
-#             f"Backfill empty | {symbol} | {timeframe}"
-#         )
-#         return
-
-#     conn = get_db_connection()
-#     try:
-#         write_candles(conn, symbol, timeframe, df)
-#     finally:
-#         conn.close()
-
-#     logger.info(
-#         f"✅ Backfill complete | {symbol} | {timeframe} | {len(df)} candles"
-#     )
 
 def run_backfill(
     symbol: str,
@@ -277,7 +183,6 @@ def run_backfill(
     try:
         last_ts = get_last_candle_ts(conn, symbol, timeframe)
 
-        # ✅ SAFE resume logic
         if last_ts and start <= last_ts < end:
             chunk_start = last_ts + _timeframe_delta(timeframe)
             logger.info(
@@ -324,6 +229,65 @@ def run_backfill(
         f"🎉 Backfill completed | {symbol} | {timeframe}"
     )
 
+# ─────────────────────────────────────────────
+# 🔥 MULTI-SYMBOL DISPATCHER (NEW)
+# ─────────────────────────────────────────────
+
+def run_multi_symbol_backfill(cfg: dict):
+    """
+    Backward compatible:
+    - supports symbol OR symbols[]
+    """
+
+    symbols = cfg.get("symbols")
+
+    if symbols is None:
+        symbols = [cfg["symbol"]]
+
+    elif isinstance(symbols, list):
+    # flatten in case of accidental nesting
+        if len(symbols) == 1 and isinstance(symbols[0], list):
+            symbols = symbols[0]
+            
+    elif isinstance(symbols, str):
+        symbols = [symbols]
+
+    timeframe = cfg["timeframe"]
+    start_raw = cfg.get("start")
+    end_raw = cfg.get("end")
+
+    if not start_raw or not end_raw:
+        raise ValueError("Backfill requires start and end dates")
+
+    def parse_date_local(value):
+        if isinstance(value, datetime):
+            return value.astimezone(IST)
+        if isinstance(value, date):
+            return IST.localize(datetime(value.year, value.month, value.day))
+        if isinstance(value, str):
+            return IST.localize(datetime.strptime(value, "%Y-%m-%d"))
+        raise ValueError(f"Invalid date: {value}")
+
+    start_dt = parse_date_local(start_raw)
+    end_dt = parse_date_local(end_raw)
+
+    logger.info(
+        f"🚀 MULTI-SYMBOL BACKFILL | symbols={symbols} | "
+        f"timeframe={timeframe} | {start_dt.date()} → {end_dt.date()}"
+    )
+
+    for symbol in symbols:
+        try:
+            run_backfill(
+                symbol=symbol,
+                timeframe=timeframe,
+                start=start_dt,
+                end=end_dt,
+            )
+        except Exception:
+            logger.exception(
+                f"❌ Backfill failed | {symbol} | {timeframe}"
+            )
 
 # ─────────────────────────────────────────────
 # CLI + YAML entry point
@@ -349,91 +313,32 @@ if __name__ == "__main__":
     parser.add_argument("--job-name")
     parser.add_argument("--symbols")
 
-    # Backfill mode
-    parser.add_argument("--symbol")
-    parser.add_argument("--tf")
-    parser.add_argument("--start")
-    parser.add_argument("--end")
-
     args = parser.parse_args()
 
-    # Load YAML config
     config = {}
     if args.config:
         logger.info(f"📄 Loading config file: {args.config}")
         with open(args.config, "r") as f:
             config = yaml.safe_load(f) or {}
 
-    def get_value(name):
-        if hasattr(args, name):
-            val = getattr(args, name)
-            if val is not None:
-                return val
-        return config.get(name)
+    mode = config.get("mode") or args.mode
 
-    def parse_date(value):
-        """
-        Accepts:
-          - str (YYYY-MM-DD)
-          - datetime.date
-          - datetime.datetime
-        Returns timezone-aware datetime (IST).
-        """
-        if isinstance(value, datetime):
-            return value.astimezone(IST)
-        if isinstance(value, date):
-            return IST.localize(datetime(value.year, value.month, value.day))
-        if isinstance(value, str):
-            return IST.localize(datetime.strptime(value, "%Y-%m-%d"))
-        raise ValueError(f"Unsupported date value: {value} ({type(value)})")
-
-    mode = get_value("mode")
-
-    # ─── JOB MODE ───
     if mode == "job":
-        job_name = get_value("job_name")
-        symbols_raw = get_value("symbols")
+        job_name = config.get("job_name")
+        symbols_raw = config.get("symbols")
 
         if not job_name or not symbols_raw:
             parser.error("--job-name and --symbols required for job mode")
 
-        symbols = [s.strip() for s in symbols_raw.split(",")]
+        if isinstance(symbols_raw, str):
+            symbols = [s.strip() for s in symbols_raw.split(",")]
+        else:
+            symbols = symbols_raw
 
-        run_ingestion_job(
-            job_name=job_name,
-            symbols=symbols,
-        )
+        run_ingestion_job(job_name=job_name, symbols=symbols)
 
-    # ─── BACKFILL MODE ───
     elif mode == "backfill":
-        symbol = get_value("symbol")
-        timeframe = get_value("timeframe") or get_value("tf")
-        start_raw = get_value("start")
-        end_raw = get_value("end")
-
-        missing = [
-            k for k, v in {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "start": start_raw,
-                "end": end_raw,
-            }.items() if v is None
-        ]
-
-        if missing:
-            parser.error(
-                f"Missing required args for backfill: {', '.join(missing)}"
-            )
-
-        start_dt = parse_date(start_raw)
-        end_dt = parse_date(end_raw)
-
-        run_backfill(
-            symbol=symbol,
-            timeframe=timeframe,
-            start=start_dt,
-            end=end_dt,
-        )
+        run_multi_symbol_backfill(config)
 
     else:
         parser.error("mode must be specified (job or backfill)")

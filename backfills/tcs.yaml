@@ -1,6 +1,12 @@
 mode: backfill
 
-symbol: RELIANCE
+symbols:
+  - SBIN
+  - AXISBANK
+  - KOTAKBANK
+  - LT
+  - ADANIPORTS
+
 timeframe: 5M
 
 start: 2020-01-01
