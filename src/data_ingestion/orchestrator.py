@@ -72,6 +72,8 @@ def align_to_timeframe(ts: datetime, timeframe: str) -> datetime:
         microsecond=0,
     )
 
+MAX_BACKFILL_DAYS = 90
+
 
 # def align_to_timeframe(ts: datetime, timeframe: str) -> datetime:
 #     ts = ts.astimezone(IST)
@@ -213,6 +215,46 @@ def run_ingestion_job(job_name: str, symbols: list[str]):
 # Pure backfill runner
 # ─────────────────────────────────────────────
 
+# def run_backfill(
+#     symbol: str,
+#     timeframe: str,
+#     start: datetime,
+#     end: datetime,
+# ):
+#     logger.info(
+#         f"🚀 Backfill start | {symbol} | {timeframe} | {start} → {end}"
+#     )
+
+#     start = align_to_timeframe(start, timeframe)
+#     end = align_to_timeframe(end, timeframe)
+
+#     if start >= end:
+#         logger.warning("Backfill start >= end — nothing to do")
+#         return
+
+#     df = fetch_candles(
+#         symbol=symbol,
+#         timeframe=timeframe,
+#         start=start,
+#         end=end,
+#     )
+
+#     if df.empty:
+#         logger.warning(
+#             f"Backfill empty | {symbol} | {timeframe}"
+#         )
+#         return
+
+#     conn = get_db_connection()
+#     try:
+#         write_candles(conn, symbol, timeframe, df)
+#     finally:
+#         conn.close()
+
+#     logger.info(
+#         f"✅ Backfill complete | {symbol} | {timeframe} | {len(df)} candles"
+#     )
+
 def run_backfill(
     symbol: str,
     timeframe: str,
@@ -230,27 +272,56 @@ def run_backfill(
         logger.warning("Backfill start >= end — nothing to do")
         return
 
-    df = fetch_candles(
-        symbol=symbol,
-        timeframe=timeframe,
-        start=start,
-        end=end,
-    )
-
-    if df.empty:
-        logger.warning(
-            f"Backfill empty | {symbol} | {timeframe}"
-        )
-        return
-
     conn = get_db_connection()
+
     try:
-        write_candles(conn, symbol, timeframe, df)
+        last_ts = get_last_candle_ts(conn, symbol, timeframe)
+
+        # ✅ SAFE resume logic
+        if last_ts and start <= last_ts < end:
+            chunk_start = last_ts + _timeframe_delta(timeframe)
+            logger.info(
+                f"🔄 Resuming backfill from last candle | {chunk_start}"
+            )
+        else:
+            chunk_start = start
+
+        while chunk_start < end:
+            chunk_end = min(
+                chunk_start + timedelta(days=MAX_BACKFILL_DAYS),
+                end,
+            )
+
+            logger.info(
+                f"📥 Fetching chunk | {symbol} | {timeframe} | "
+                f"{chunk_start} → {chunk_end}"
+            )
+
+            df = fetch_candles(
+                symbol=symbol,
+                timeframe=timeframe,
+                start=chunk_start,
+                end=chunk_end,
+            )
+
+            if not df.empty:
+                write_candles(conn, symbol, timeframe, df)
+                logger.info(
+                    f"✅ Inserted {len(df)} candles | "
+                    f"{chunk_start} → {chunk_end}"
+                )
+            else:
+                logger.warning(
+                    f"⚠️ Empty chunk | {chunk_start} → {chunk_end}"
+                )
+
+            chunk_start = chunk_end
+
     finally:
         conn.close()
 
     logger.info(
-        f"✅ Backfill complete | {symbol} | {timeframe} | {len(df)} candles"
+        f"🎉 Backfill completed | {symbol} | {timeframe}"
     )
 
 

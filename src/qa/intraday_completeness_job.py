@@ -10,6 +10,10 @@ from data_ingestion.timeframe_mapper import TIMEFRAMES
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
+# ─────────────────────────────────────────────
+# Timeframe helpers
+# ─────────────────────────────────────────────
+
 TIMEFRAME_MINUTES = {
     tf: meta["minutes"]
     for tf, meta in TIMEFRAMES.items()
@@ -34,8 +38,11 @@ def parse_date(value):
 
 def expected_intraday_candles(trade_date, timeframe, market_open, market_close):
     """
-    Generate expected candle timestamps for one trading day.
+    Generate expected intraday candle timestamps for one trading day.
     """
+    if timeframe == "1D":
+        raise ValueError("1D timeframe is not intraday")
+
     step = timedelta(minutes=TIMEFRAME_MINUTES[timeframe])
 
     start = IST.localize(datetime.combine(trade_date, market_open))
@@ -80,14 +87,79 @@ def fetch_actual_candles(conn, symbol, timeframe, start_ts, end_ts):
 
 
 # ─────────────────────────────────────────────
-# QA Job
+# DAILY QA (1D)
+# ─────────────────────────────────────────────
+
+def run_daily_completeness_check(cfg) -> bool:
+    """
+    Daily candle QA:
+    - Exactly one candle per trading day
+    - Timestamp aligned to 00:00 IST
+    """
+
+    symbol = cfg["symbol"]
+    timeframe = cfg["timeframe"]
+
+    start_raw = cfg.get("start_date") or cfg.get("start")
+    end_raw = cfg.get("end_date") or cfg.get("end")
+
+    start_date = parse_date(start_raw)
+    end_date = parse_date(end_raw)
+
+    holiday_agent = MarketHolidayAgent()
+    conn = get_db_connection()
+
+    total_missing = 0
+    current = start_date
+
+    while current <= end_date:
+
+        if not holiday_agent.is_trading_day(current):
+            logger.info(f"⏭️ {current} — holiday/weekend")
+            current += timedelta(days=1)
+            continue
+
+        expected_ts = IST.localize(
+            datetime.combine(current, time(0, 0))
+        )
+
+        actual = fetch_actual_candles(
+            conn,
+            symbol,
+            timeframe,
+            expected_ts,
+            expected_ts + timedelta(days=1),
+        )
+
+        if not actual:
+            logger.error(f"❌ {current} — missing daily candle")
+            total_missing += 1
+        else:
+            logger.info(f"✅ {current} — OK")
+
+        current += timedelta(days=1)
+
+    conn.close()
+
+    if total_missing > 0:
+        logger.error(
+            f"❌ DAILY QA FAILED | missing days = {total_missing}"
+        )
+        return False
+
+    logger.info("🎉 DAILY QA PASSED — all daily candles present")
+    return True
+
+
+# ─────────────────────────────────────────────
+# INTRADAY QA
 # ─────────────────────────────────────────────
 
 def run_intraday_completeness_check(config_path: str) -> bool:
     """
     Automated QA job:
-    - Sync holidays for required years
-    - Validate intraday candle completeness
+    - Validates intraday candle completeness
+    - Automatically routes 1D to daily QA
     """
 
     logger.info(f"📄 Loading QA config: {config_path}")
@@ -96,16 +168,21 @@ def run_intraday_completeness_check(config_path: str) -> bool:
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f) or {}
 
+    symbol = cfg["symbol"]
+    timeframe = cfg["timeframe"]
+
+    # ✅ Route DAILY timeframe early
+    if timeframe == "1D":
+        logger.info("⏭️ Detected 1D timeframe — running daily QA")
+        return run_daily_completeness_check(cfg)
+
     # ─── Respect checks flag ───
     checks = cfg.get("checks", {})
     if not checks.get("intraday_completeness", True):
         logger.info("⏭️ Intraday completeness check disabled via config")
         return True
 
-    symbol = cfg["symbol"]
-    timeframe = cfg["timeframe"]
-
-    # ─── Extract date range (backfill-aware) ───
+    # ─── Extract date range ───
     start_raw = cfg.get("start_date") or cfg.get("start")
     end_raw = cfg.get("end_date") or cfg.get("end")
 
@@ -124,10 +201,9 @@ def run_intraday_completeness_check(config_path: str) -> bool:
         f"🔍 QA START | {symbol} | {timeframe} | {start_date} → {end_date}"
     )
 
-    # ─── Holiday sync (range-based, NOT current year) ───
     holiday_agent = MarketHolidayAgent()
-
     conn = get_db_connection()
+
     total_missing = 0
     current = start_date
 
@@ -155,7 +231,6 @@ def run_intraday_completeness_check(config_path: str) -> bool:
         missing = sorted(set(expected) - set(actual))
 
         if missing:
-            # Full-day missing (likely holiday / exchange closed)
             if allow_missing_days and len(missing) == len(expected):
                 logger.warning(
                     f"⏭️ {current} — full-day missing (treated as holiday)"

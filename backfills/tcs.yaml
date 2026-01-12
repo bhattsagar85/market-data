@@ -1,10 +1,10 @@
 mode: backfill
 
-symbol: TCS
+symbol: RELIANCE
 timeframe: 5M
 
-start: 2024-01-01
-end: 2024-04-01
+start: 2020-01-01
+end: 2026-01-11
 
 market:
   open: "09:15"

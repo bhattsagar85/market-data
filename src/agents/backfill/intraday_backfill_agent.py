@@ -3,7 +3,6 @@ import time
 import pytz
 import logging
 
-from brokers.shoonya_client import ShoonyaClient
 from data_ingestion.db import get_db_connection
 from data_ingestion.insert import insert_ohlcv_batch
 from agents.calendar.market_holiday_agent import MarketHolidayAgent
@@ -32,7 +31,7 @@ class IntradayBackfillAgent:
     def __init__(self, exchange: str = "NSE"):
         self.exchange = exchange
         self.holiday_agent = MarketHolidayAgent(exchange)
-        self.client = ShoonyaClient()
+       
 
     # ─────────────────────────────────────────────
     # ENTRY POINT
