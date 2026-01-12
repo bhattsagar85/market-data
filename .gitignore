@@ -1,0 +1,7 @@
+.venv
+data/
+__pycache__/
+*.log
+.env
+EOF
+kite_token.json

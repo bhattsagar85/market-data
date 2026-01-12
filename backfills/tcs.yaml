@@ -1,0 +1,15 @@
+mode: backfill
+
+symbol: TCS
+timeframe: 5M
+
+start: 2024-01-01
+end: 2024-04-01
+
+market:
+  open: "09:15"
+  close: "15:30"
+
+checks:
+  intraday_completeness: true
+  allow_missing_days: false

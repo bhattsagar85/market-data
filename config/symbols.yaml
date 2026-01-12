@@ -1,0 +1,31 @@
+exchange: NSE
+
+indices:
+  - symbol: NIFTY
+    description: NIFTY 50 Index
+
+  - symbol: BANKNIFTY
+    description: NIFTY Bank Index
+
+equities:
+  - symbol: RELIANCE
+    description: Reliance Industries Ltd
+
+  - symbol: TCS
+    description: Tata Consultancy Services
+
+  - symbol: HDFCBANK
+    description: HDFC Bank Ltd
+
+  - symbol: INFY
+    description: Infosys Ltd
+
+  - symbol: ICICIBANK
+    description: ICICI Bank Ltd
+
+history:
+  years: 5
+  interval_priority:
+    - minute
+    - 5minute
+    - day

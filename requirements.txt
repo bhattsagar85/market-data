@@ -1,0 +1,13 @@
+pandas
+pyarrow
+python-dateutil
+requests
+duckdb
+PyYAML
+websocket-client
+apscheduler
+psycopg2-binary
+fastapi
+uvicorn
+kiteconnect
+
