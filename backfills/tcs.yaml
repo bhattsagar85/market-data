@@ -1,16 +1,30 @@
 mode: backfill
 
 symbols:
-  - SBIN
-  - AXISBANK
-  - KOTAKBANK
-  - LT
+  - RELIANCE
+  - INFY
+  - TCS
+  - ICICIBANK
+  - SBIN 
+  - ADANIENT
   - ADANIPORTS
+  - AXISBANK
+  - BAJFINANCE
+  - DLF
+  - HDFCBANK
 
-timeframe: 5M
+timeframes:
+  - 5M
+  - 10M
+  - 15M
+  - 1D
 
-start: 2020-01-01
-end: 2026-01-11
+start: 2015-01-01
+end: 2015-01-01
+
+market:
+  open: "09:15"
+  close: "15:30"
 
 market:
   open: "09:15"
